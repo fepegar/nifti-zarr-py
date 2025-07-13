@@ -152,6 +152,7 @@ def _make_pyramid3d(
         nb_levels: int,
         pyramid_fn: Callable = pyramid_gaussian,
         label: bool = False,
+        fast: bool = False,
         no_pyramid_axis: Optional[Union[str, int]] = None,
 ) -> Generator[np.ndarray, None, None]:
     """
@@ -167,6 +168,8 @@ def _make_pyramid3d(
         Function to generate pyramid levels.
     label : bool, optional
         Whether the data is a label volume.
+    fast : bool, optional
+        If True, use a faster method for generating the label pyramid.
     no_pyramid_axis : Optional[Union[str, int]], optional
         The axis that should not be downsampled.
 
@@ -208,7 +211,7 @@ def _make_pyramid3d(
         for level in pyramid:
             yield level
 
-    pyramid = pyramid_labels if label else pyramid_values
+    pyramid = pyramid_labels if label and not fast else pyramid_values
 
     for level in zip(*map(pyramid, data3d)):
         yield np.stack(level).reshape(batch + level[0].shape)
@@ -437,6 +440,7 @@ def nii2zarr(
         nb_levels: int = -1,
         method: Literal['gaussian', 'laplacian'] = 'gaussian',
         label: Optional[bool] = None,
+        fast: bool = False,
         no_time: bool = False,
         no_pyramid_axis: Optional[Union[str, int]] = None,
         fill_value: Optional[Union[int, float, complex]] = None,
@@ -481,6 +485,8 @@ def nii2zarr(
         Method used to compute the pyramid.
     label : bool, optional
         Is this is a label volume?  If `None`, guess from intent code.
+    fast : bool, optional
+        If True, use a faster method for generating the label pyramid.
     no_time : bool, optional
         If True, there is no time dimension so the 4th dimension
         (if it exists) should be interpreted as the channel dimensions.
@@ -600,7 +606,7 @@ def nii2zarr(
         nb_levels = default_nb_levels
 
     data = list(_make_pyramid3d(data, nb_levels, pyramid_fn, label,
-                                no_pyramid_axis))
+                                fast, no_pyramid_axis))
 
     # Fix data type
     # If nifti was swapped when loading it, we want to swapped it back
@@ -711,6 +717,10 @@ def cli(args=None):
     parser.add_argument(
         '--label', action='store_true', default=None,
         help='Segmentation volume.')
+    parser.add_argument(
+        '--fast', action='store_true',
+        help='Use a faster method for generating the label pyramid.'
+    )
     parser.add_argument(
         '--no-label', action='store_false', dest='label',
         help='Not a segmentation volume.')
