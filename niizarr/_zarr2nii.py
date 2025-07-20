@@ -232,10 +232,12 @@ def zarr2nii(
         if offsets:
             phys1[:3, -1] = list(reversed(offsets[-3:]))
 
-        qform = qform @ (np.linalg.inv(phys0) @ phys1)
-        sform = sform @ (np.linalg.inv(phys0) @ phys1)
-        niiheader.set_qform(qform, qcode)
-        niiheader.set_sform(sform, scode)
+        if qform is not None:
+            qform = qform @ (np.linalg.inv(phys0) @ phys1)
+            niiheader.set_qform(qform, qcode)
+        if sform is not None:
+            sform = sform @ (np.linalg.inv(phys0) @ phys1)
+            niiheader.set_sform(sform, scode)
 
     # load/map array with dask
     if is_group:
