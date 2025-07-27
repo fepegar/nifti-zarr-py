@@ -5,6 +5,7 @@ import math
 import re
 import sys
 from argparse import ArgumentDefaultsHelpFormatter
+from functools import partial
 from typing import (
     Literal, Union, List, Optional, Callable, Generator, Any, Tuple
 )
@@ -191,9 +192,9 @@ def _make_pyramid3d(
     data3d = data3d.reshape((-1, *nxyz))
     max_layer = nb_levels - 1
 
-    def pyramid_values(x):
+    def pyramid_values(x, **kwargs):
         return pyramid_fn(x, max_layer, 2, preserve_range=True,
-                          channel_axis=no_pyramid_axis)
+                          channel_axis=no_pyramid_axis, **kwargs)
 
     def pyramid_labels(x):
         yield x
@@ -212,7 +213,13 @@ def _make_pyramid3d(
         for level in pyramid:
             yield level
 
-    pyramid = pyramid_labels if label and not fast else pyramid_values
+    if label:
+        if fast:
+            pyramid = partial(pyramid_values, order=0, sigma=0)
+        else:
+            pyramid = pyramid_labels
+    else:
+        pyramid = pyramid_values
 
     for level in zip(*map(pyramid, data3d)):
         yield np.stack(level).reshape(batch + level[0].shape)
