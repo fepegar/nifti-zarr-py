@@ -4,6 +4,8 @@ import json
 import math
 import re
 import sys
+from argparse import ArgumentDefaultsHelpFormatter
+from functools import partial
 from typing import (
     Literal, Union, List, Optional, Callable, Generator, Any, Tuple
 )
@@ -152,6 +154,7 @@ def _make_pyramid3d(
         nb_levels: int,
         pyramid_fn: Callable = pyramid_gaussian,
         label: bool = False,
+        fast: bool = False,
         no_pyramid_axis: Optional[Union[str, int]] = None,
 ) -> Generator[np.ndarray, None, None]:
     """
@@ -167,6 +170,8 @@ def _make_pyramid3d(
         Function to generate pyramid levels.
     label : bool, optional
         Whether the data is a label volume.
+    fast : bool, optional
+        If True, use a faster method for generating the label pyramid.
     no_pyramid_axis : Optional[Union[str, int]], optional
         The axis that should not be downsampled.
 
@@ -187,9 +192,9 @@ def _make_pyramid3d(
     data3d = data3d.reshape((-1, *nxyz))
     max_layer = nb_levels - 1
 
-    def pyramid_values(x):
+    def pyramid_values(x, **kwargs):
         return pyramid_fn(x, max_layer, 2, preserve_range=True,
-                          channel_axis=no_pyramid_axis)
+                          channel_axis=no_pyramid_axis, **kwargs)
 
     def pyramid_labels(x):
         yield x
@@ -208,25 +213,31 @@ def _make_pyramid3d(
         for level in pyramid:
             yield level
 
-    pyramid = pyramid_labels if label else pyramid_values
+    if label:
+        if fast:
+            pyramid = partial(pyramid_values, order=0, sigma=0)
+        else:
+            pyramid = pyramid_labels
+    else:
+        pyramid = pyramid_values
 
     for level in zip(*map(pyramid, data3d)):
         yield np.stack(level).reshape(batch + level[0].shape)
 
 
 def write_ome_metadata(
-        omz: zarr.Group,
-        axes: List[str],
-        space_scale: Union[float, List[float]] = 1.0,
-        time_scale: float = 1.0,
-        space_unit: str = "micrometer",
-        time_unit: str = "second",
-        name: str = "",
-        pyramid_aligns: Union[str, int, List[str], List[int]] = 2,
-        levels: Optional[int] = None,
-        no_pool: Optional[int] = None,
-        multiscales_type: str = "",
-        ome_version: Literal["0.4", "0.5"] = "0.4"
+    omz: zarr.Group,
+    axes: List[str],
+    space_scale: Union[float, List[float]] = 1.0,
+    time_scale: float = 1.0,
+    space_unit: str = "micrometer",
+    time_unit: str = "second",
+    name: str = "",
+    pyramid_aligns: Union[str, int, List[str], List[int]] = 2,
+    levels: Optional[int] = None,
+    no_pool: Optional[int] = None,
+    multiscales_type: str = "",
+    ome_version: Literal["0.4", "0.5"] = "0.4"
 ) -> None:
     """
     Write OME metadata into Zarr.
@@ -255,143 +266,109 @@ def write_ome_metadata(
         Number of existing levels. Default: find out automatically.
 
     """
-    # Read shape at each pyramid level
+    # 1) Pull out all pyramid-level shapes
     shapes = []
-    level = 0
+    lvl = 0
     while True:
-        if levels is not None and level > levels:
+        if levels is not None and lvl > levels:
             break
-
-        if str(level) not in omz.keys():
-            levels = level
+        key = str(lvl)
+        if key not in omz:
             break
-        shapes += [
-            omz[str(level)].shape,
-        ]
-        level += 1
+        shapes.append(omz[key].shape)
+        lvl += 1
 
-    axis_to_type = {
-        "x": "space",
-        "y": "space",
-        "z": "space",
-        "t": "time",
-        "c": "channel",
-    }
+    if not shapes:
+        return  # nothing to do
 
-    # Number of spatial (s), batch (b) and total (n) dimensions
+    # 2) Map axes → types, count spatial vs. others
+    axis_to_type = dict(x="space", y="space", z="space", t="time", c="channel")
+    types = [axis_to_type[a] for a in axes]
     ndim = len(axes)
-    sdim = sum(axis_to_type[axis] == "space" for axis in axes)
+    sdim = types.count("space")
     bdim = ndim - sdim
 
-    if isinstance(pyramid_aligns, (int, str)):
-        pyramid_aligns = [pyramid_aligns]
-    pyramid_aligns = list(pyramid_aligns)
-    if len(pyramid_aligns) < sdim:
-        repeat = pyramid_aligns[:1] * (sdim - len(pyramid_aligns))
-        pyramid_aligns = repeat + pyramid_aligns
-    pyramid_aligns = pyramid_aligns[-sdim:]
+    # 3) Normalize space_scale and pyramid_aligns to length==sdim
+    def _normalize(val, length):
+        if not isinstance(val, (list, tuple)):
+            val = [val]
+        if len(val) < length:
+            val = [val[0]] * (length - len(val)) + list(val)
+        return val[-length:]
+    space_scale = _normalize(space_scale, sdim)
+    aligns = _normalize(pyramid_aligns, sdim)
 
-    if isinstance(space_scale, (int, float)):
-        space_scale = [space_scale]
-    space_scale = list(space_scale)
-    if len(space_scale) < sdim:
-        repeat = space_scale[:1] * (sdim - len(space_scale))
-        space_scale = repeat + space_scale
-    space_scale = space_scale[-sdim:]
-
-    multiscales = [
-        {
-            "version": ome_version,
-            "axes": [
-                {
-                    "name": axis,
-                    "type": axis_to_type[axis],
-                }
-                if axis_to_type[axis] == "channel"
-                else {
-                    "name": axis,
-                    "type": axis_to_type[axis],
-                    "unit": (
-                        space_unit
-                        if axis_to_type[axis] == "space"
-                        else time_unit
-                        if axis_to_type[axis] == "time"
-                        else None
-                    ),
-                }
-                for axis in axes
-            ],
-            "datasets": [],
-            "type": "median window " + "x".join(["2"] * sdim)
-            if not multiscales_type
-            else multiscales_type,
-            "name": name,
-        }
-    ]
-
+    # 4) Precompute base shape
     shape0 = shapes[0]
-    for n in range(len(shapes)):
-        shape = shapes[n]
-        multiscales[0]["datasets"].append({})
-        level = multiscales[0]["datasets"][-1]
-        level["path"] = str(n)
 
-        scale = [1] * bdim + [
-            (
-                pyramid_aligns[i] ** n
-                if not isinstance(pyramid_aligns[i], str)
-                else (shape0[bdim + i] / shape[bdim + i])
-                if pyramid_aligns[i][0].lower() == "e"
-                else ((shape0[bdim + i] - 1) / (shape[bdim + i] - 1))
-            )
-            * space_scale[i]
-            if i != no_pool
-            else space_scale[i]
-            for i in range(sdim)
-        ]
-        translation = [0] * bdim + [
-            (
-                pyramid_aligns[i] ** n - 1
-                if not isinstance(pyramid_aligns[i], str)
-                else (shape0[bdim + i] / shape[bdim + i]) - 1
-                if pyramid_aligns[i][0].lower() == "e"
-                else 0
-            )
-            * 0.5
-            * space_scale[i]
-            if i != no_pool
-            else 0
-            for i in range(sdim)
-        ]
+    # 5) Build the multiscales dict
+    ms: dict = {
+        "version": ome_version,
+        "name": name,
+        "type": multiscales_type or f"median window {'x'.join(['2']*sdim)}",
+        "axes": [
+            dict(name=a, type=t, **({"unit": space_unit} if t=="space" else {"unit": time_unit} if t=="time" else {}))
+            for a, t in zip(axes, types)
+        ],
+        "datasets": [],
+    }
 
-        level["coordinateTransformations"] = [
-            {
-                "type": "scale",
-                "scale": scale,
-            },
-            {
-                "type": "translation",
-                "translation": translation,
-            },
-        ]
+    # Helper to compute per-dimension scale/translation
+    def _factor(a0, aN, align, n, scale, is_pool):
+        if is_pool:
+            # no pooling along this axis
+            return scale, 0.0
+        if isinstance(align, str) and align.lower().startswith("e"):
+            factor = (a0 / aN)
+            trans = (factor - 1) * 0.5
+        elif isinstance(align, str) and align.lower().startswith("c"):
+            factor = ((a0 - 1) / (aN - 1))
+            trans = 0.0
+        else:
+            # numeric align: repeated power
+            factor = (align ** n)
+            trans = (factor - 1) * 0.5
+        return factor * scale, trans * scale
 
-    scale = [1.0] * ndim
-    if "t" in axes:
-        scale[axes.index("t")] = time_scale
-    multiscales[0]["coordinateTransformations"] = [{
-        "scale": scale, "type": "scale"
-    }]
+    prev_scale_axes = [None] * sdim
+    prev_trans_axes = [None] * sdim
+    # 7) Populate each pyramid level
+    for n, shape in enumerate(shapes):
+        # compute scale+translation arrays of length ndim
+        scale = [1.0]*bdim + []
+        translation = [0.0]*bdim + []
+        for i in range(sdim):
+            a0 = shape0[bdim+i]
+            aN = shape[bdim+i]
+            is_pool = (i == no_pool)
+            if n > 0 and shapes[n-1][bdim + i] == aN:
+                # no change from last level → re‐use
+                s, tr = prev_scale_axes[i], prev_trans_axes[i]
+            else:
+                s, tr = _factor(a0, aN, aligns[i], n, space_scale[i], is_pool)
+            scale.append(s)
+            translation.append(tr)
+            prev_scale_axes[i] = s
+            prev_trans_axes[i] = tr
 
-    multiscales[0]["version"] = ome_version
-    if ome_version == "0.4":
-        omz.attrs["multiscales"] = multiscales
-    elif ome_version == "0.5":
-        # old neuroglancer doesn't check "ome" for multiscales, so we need to
-        # duplicate the information
-        omz.attrs["multiscales"] = multiscales
-        omz.attrs["ome"] = {"multiscales": multiscales}
-    else:
-        raise Exception("Unsupported ome version")
+        ms["datasets"].append({
+            "path": str(n),
+            "coordinateTransformations": [
+                {"type":"scale",       "scale": scale},
+                {"type":"translation", "translation": translation},
+            ]
+        })
+
+    # 8) Add global time‐scale transformation
+    tscale = [time_scale if t=="time" else 1.0 for t in types]
+    ms["coordinateTransformations"] = [{"type":"scale", "scale": tscale}]
+
+    # 9) Write into Zarr attributes
+    omz.attrs["multiscales"] = [ms]
+    if ome_version == "0.5":
+        omz.attrs["ome"] = {"multiscales": [ms]}
+    elif ome_version not in {"0.4","0.5"}:
+        raise ValueError(f"Unsupported ome_version {ome_version}")
 
 
 def write_nifti_header(
@@ -437,6 +414,7 @@ def nii2zarr(
         nb_levels: int = -1,
         method: Literal['gaussian', 'laplacian'] = 'gaussian',
         label: Optional[bool] = None,
+        fast: bool = False,
         no_time: bool = False,
         no_pyramid_axis: Optional[Union[str, int]] = None,
         fill_value: Optional[Union[int, float, complex]] = None,
@@ -481,6 +459,8 @@ def nii2zarr(
         Method used to compute the pyramid.
     label : bool, optional
         Is this is a label volume?  If `None`, guess from intent code.
+    fast : bool, optional
+        If True, use a faster method for generating the label pyramid.
     no_time : bool, optional
         If True, there is no time dimension so the 4th dimension
         (if it exists) should be interpreted as the channel dimensions.
@@ -541,7 +521,7 @@ def nii2zarr(
         elif np.issubdtype(data.dtype, np.bool_):
             fill_value = bool(fill_value)
 
-    
+
     # Fix array shape
     nbatch = data.ndim - 3
     if data.ndim == 5:
@@ -600,7 +580,7 @@ def nii2zarr(
         nb_levels = default_nb_levels
 
     data = list(_make_pyramid3d(data, nb_levels, pyramid_fn, label,
-                                no_pyramid_axis))
+                                fast, no_pyramid_axis))
 
     # Fix data type
     # If nifti was swapped when loading it, we want to swapped it back
@@ -619,7 +599,7 @@ def nii2zarr(
     # Prepare array metadata at each level
     compressor = _make_compressor(compressor, zarr_version=zarr_version,
                                   **compressor_options)
-    
+
     chunk = tuple(chunk) if isinstance(chunk, (list, tuple)) else (chunk,)
     chunk = chunk + chunk[-1:] * max(0, 3 - len(chunk)) + chunk_tc
     chunk = tuple(chunk[i] for i in perm)
@@ -666,7 +646,8 @@ def nii2zarr(
 def cli(args=None):
     """    Command-line entrypoint"""
     parser = argparse.ArgumentParser(
-        'nii2zarr', description='Convert nifti to nifti-zarr.')
+        'nii2zarr', description='Convert nifti to nifti-zarr.',
+        formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument(
         'input', help='Input nifti file.')
     parser.add_argument(
@@ -711,6 +692,10 @@ def cli(args=None):
     parser.add_argument(
         '--label', action='store_true', default=None,
         help='Segmentation volume.')
+    parser.add_argument(
+        '--fast', action='store_true',
+        help='Use a faster method for generating the label pyramid.'
+    )
     parser.add_argument(
         '--no-label', action='store_false', dest='label',
         help='Not a segmentation volume.')

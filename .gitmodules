@@ -1,3 +1,0 @@
-[submodule "nifti-zarr-schema"]
-	path = nifti-zarr-schema
-	url = https://github.com/neuroscales/nifti-zarr
